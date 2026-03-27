@@ -1,0 +1,825 @@
+// ══════════════════════════════════════════════
+//  CONSTANTS
+// ══════════════════════════════════════════════
+const PALETTE = ['#185FA5','#0F6E56','#3C3489','#c27c10','#7a2060','#0F5E6B','#8B3A3A','#2E6B3E'];
+const PALE    = ['#0d2a45','#0a2e20','#1a1535','#3a2500','#2e0e28','#0a2830','#2e1515','#0f2a1a'];
+const TYPES   = ['INT','BIGINT','VARCHAR','TEXT','DATE','DATETIME','BOOLEAN','DECIMAL(10,2)','FLOAT','UUID'];
+const TABLE_W = 220;
+const ROW_H   = 26;
+const HEADER_H= 36;
+
+// ══════════════════════════════════════════════
+//  Col CLASS
+// ══════════════════════════════════════════════
+class Col {
+  constructor(id, name, type='VARCHAR', pk=false, fk=false){
+    this.id=id; 
+    this.name=name; 
+    this.type=type; 
+    this.pk=pk; 
+    this.fk=fk;
+  }
+  togglePK(){ 
+    this.pk=!this.pk 
+  }
+  toggleFK(){ 
+    this.fk=!this.fk 
+  }
+  setName(v){ 
+    this.name=v 
+  }
+  setType(v){ 
+    this.type=v 
+  }
+  clone(){ 
+    return new Col(this.id,this.name,this.type,this.pk,this.fk) 
+  }
+  toSQL(){
+    let s=`  \`${this.name}\` ${this.type}`;
+    if(this.pk) s+=' NOT NULL PRIMARY KEY';
+    return s;
+  }
+}
+
+// ══════════════════════════════════════════════
+//  Table CLASS
+// ══════════════════════════════════════════════
+class Table {
+  constructor(id,x,y,name=null){
+    this.id=id; 
+    this.x=x; 
+    this.y=y;
+    this.name=name||'table_'+id;
+    this.cols=[];
+    this.color=PALETTE[id%PALETTE.length];
+    this.pale=PALE[id%PALE.length];
+  }
+  get height(){ 
+    return HEADER_H+this.cols.length*ROW_H+8 
+  }
+  addCol(col){ 
+    this.cols.push(col) 
+  }
+  removeCol(colId){ 
+    this.cols=this.cols.filter(c=>c.id!==colId) 
+  }
+  getCol(colId){ return this.cols.find(c=>c.id===colId) }
+  rename(v){ this.name=v }
+  setColor(idx){ this.color=PALETTE[idx]; this.pale=PALE[idx] }
+  setPosition(x,y){ this.x=x; this.y=y }
+  move(dx,dy){ this.x+=dx; this.y+=dy }
+  contains(wx,wy){
+    return wx>=this.x&&wx<=this.x+TABLE_W&&wy>=this.y&&wy<=this.y+this.height
+  }
+  edgeTo(other){
+    const fcx=this.x+TABLE_W/2, fcy=this.y+this.height/2;
+    const tcx=other.x+TABLE_W/2, tcy=other.y+other.height/2;
+    const dx=tcx-fcx, dy=tcy-fcy;
+    if(Math.abs(dx)>Math.abs(dy)) return[fcx+(dx>0?TABLE_W/2:-TABLE_W/2),fcy];
+    return[fcx,fcy+(dy>0?this.height/2:-this.height/2)];
+  }
+  toSQL(rels,tables){
+    const lines=[`CREATE TABLE \`${this.name}\` (`];
+    lines.push(this.cols.map(c=>c.toSQL()).join(',\n'));
+    rels.filter(r=>r.from===this.id).forEach(r=>{
+      const target=tables.find(t=>t.id===r.to); if(!target) return;
+      const fkCol=this.cols.find(c=>c.fk)||this.cols[0];
+      const pkCol=target.cols.find(c=>c.pk)||{name:'id'};
+      if(fkCol) lines.push(`,\n  CONSTRAINT \`fk_${this.name}_${target.name}\`\n    FOREIGN KEY (\`${fkCol.name}\`) REFERENCES \`${target.name}\`(\`${pkCol.name}\`)`);
+    });
+    lines.push(');');
+    return lines.join('\n');
+  }
+  toJSON(){ return{id:this.id,x:this.x,y:this.y,name:this.name,cols:this.cols,color:this.color,pale:this.pale} }
+  static fromJSON(obj){
+    const t=new Table(obj.id,obj.x,obj.y,obj.name);
+    t.color=obj.color; t.pale=obj.pale;
+    t.cols=obj.cols.map(c=>new Col(c.id,c.name,c.type,c.pk,c.fk));
+    return t;
+  }
+}
+
+// ══════════════════════════════════════════════
+//  Relation CLASS
+// ══════════════════════════════════════════════
+class Relation {
+  constructor(fromId,toId,type='1:N'){ 
+    this.from=fromId; 
+    this.to=toId; 
+    this.type=type 
+  }
+  setType(v){ 
+    this.type=v 
+  }
+  toJSON(){ return{from:this.from,to:this.to,type:this.type} }
+  static fromJSON(obj){ return new Relation(obj.from,obj.to,obj.type) }
+}
+
+// ══════════════════════════════════════════════
+//  ERDCanvas CLASS
+// ══════════════════════════════════════════════
+class ERDCanvas {
+  constructor(canvasEl,wrapEl){
+    this.cvs=canvasEl; 
+    this.wrap=wrapEl;
+    this.ctx=canvasEl.getContext('2d');
+    this.dpr=window.devicePixelRatio||1;
+    this.tables=[]; 
+    this.rels=[]; 
+    this._uid=1;
+    this.zoom=1; 
+    this.panX=0; 
+    this.panY=0;
+    this.drag=null; 
+    this.selected=null;
+    this.connectMode=false; 
+    this.connectStart=null;
+    this.isPanning=false; 
+    this.panStart=null;
+    this._bindEvents();
+    this.resize();
+  }
+  gid(){ return this._uid++ }
+  _syncUid(){
+    let max=0;
+    this.tables.forEach(t=>{
+      if(t.id>max) max=t.id;
+      t.cols.forEach(c=>{if(c.id>max) max=c.id});
+    });
+    this._uid=max+1;
+  }
+  resize(){
+    const W=this.wrap.clientWidth, H=this.wrap.clientHeight;
+    this.W=W; this.H=H;
+    this.cvs.width=W*this.dpr; this.cvs.height=H*this.dpr;
+    this.cvs.style.width=W+'px'; this.cvs.style.height=H+'px';
+    this.ctx.scale(this.dpr,this.dpr);
+    this.draw();
+  }
+  toScreen(x,y){ return[x*this.zoom+this.panX,y*this.zoom+this.panY] }
+  toWorld(x,y){ return[(x-this.panX)/this.zoom,(y-this.panY)/this.zoom] }
+  centerWorld(){ return this.toWorld(this.W/2,this.H/2) }
+  createTable(name,cols=[]){
+    const id=this.gid();
+    const[cx,cy]=this.centerWorld();
+    const t=new Table(id,cx-TABLE_W/2,cy-60,name);
+    if(cols.length===0){
+      t.addCol(new Col(this.gid(),'id','INT',true,false));
+      t.addCol(new Col(this.gid(),'name','VARCHAR',false,false));
+    } else {
+      cols.forEach(c=>t.addCol(new Col(this.gid(),c.name,c.type,c.pk,c.fk)));
+    }
+    this.tables.push(t);
+    this.selected={type:'table',id};
+    this.draw();
+    return t;
+  }
+  deleteSelected(){
+    if(!this.selected) return;
+    if(this.selected.type==='table'){
+      this.tables=this.tables.filter(t=>t.id!==this.selected.id);
+      this.rels=this.rels.filter(r=>r.from!==this.selected.id&&r.to!==this.selected.id);
+    } else if(this.selected.type==='rel'){
+      this.rels.splice(this.selected.idx,1);
+    }
+    this.selected=null; this.draw(); return true;
+  }
+  clearAll(){ this.tables=[]; this.rels=[]; this.selected=null; this.draw() }
+  addRelation(fromId,toId,type='1:N'){
+    if(!this.rels.some(r=>r.from===fromId&&r.to===toId)){
+      this.rels.push(new Relation(fromId,toId,type));
+      this.selected={type:'rel',idx:this.rels.length-1};
+    }
+  }
+  zoomAt(sx,sy,factor){
+    const nz=Math.max(0.25,Math.min(3,this.zoom*factor));
+    this.panX=sx-(sx-this.panX)*(nz/this.zoom);
+    this.panY=sy-(sy-this.panY)*(nz/this.zoom);
+    this.zoom=nz; this.draw();
+  }
+  zoomIn(){ this.zoomAt(this.W/2,this.H/2,1.2) }
+  zoomOut(){ this.zoomAt(this.W/2,this.H/2,1/1.2) }
+  fitView(){
+    if(!this.tables.length){this.zoom=1;this.panX=0;this.panY=0;this.draw();return}
+    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+    this.tables.forEach(t=>{
+      minX=Math.min(minX,t.x); minY=Math.min(minY,t.y);
+      maxX=Math.max(maxX,t.x+TABLE_W); maxY=Math.max(maxY,t.y+t.height);
+    });
+    const pw=maxX-minX+100, ph=maxY-minY+100;
+    this.zoom=Math.min(this.W/pw,this.H/ph,1.5);
+    this.panX=this.W/2-((minX+maxX)/2)*this.zoom;
+    this.panY=this.H/2-((minY+maxY)/2)*this.zoom;
+    this.draw();
+  }
+  hitTable(wx,wy){
+    for(let i=this.tables.length-1;i>=0;i--)
+      if(this.tables[i].contains(wx,wy)) return this.tables[i];
+    return null;
+  }
+  hitRel(wx,wy){
+    for(let i=0;i<this.rels.length;i++){
+      const r=this.rels[i];
+      const ft=this.tables.find(t=>t.id===r.from), tt=this.tables.find(t=>t.id===r.to);
+      if(!ft||!tt) continue;
+      const[x1,y1]=ft.edgeTo(tt),[x2,y2]=tt.edgeTo(ft);
+      const mx=(x1+x2)/2, my=(y1+y2)/2;
+      const dx=wx-mx, dy=wy-my;
+      if(Math.sqrt(dx*dx+dy*dy)<18) return i;
+    }
+    return -1;
+  }
+  draw(){
+    const c=this.ctx, W=this.W, H=this.H;
+    c.clearRect(0,0,W,H);
+    c.save();
+    c.translate(this.panX,this.panY);
+    c.scale(this.zoom,this.zoom);
+    this._drawGrid(W,H);
+    this._drawRels();
+    this._drawConnectHighlight();
+    this._drawTables();
+    c.restore();
+  }
+  _drawGrid(W,H){
+    const c=this.ctx, step=40;
+    const ox=-this.panX/this.zoom, oy=-this.panY/this.zoom;
+    const gx0=Math.floor(ox/step)*step, gy0=Math.floor(oy/step)*step;
+    c.strokeStyle='rgba(255,255,255,0.04)'; c.lineWidth=0.5;
+    for(let x=gx0;x<ox+W/this.zoom;x+=step){c.beginPath();c.moveTo(x,oy);c.lineTo(x,oy+H/this.zoom);c.stroke()}
+    for(let y=gy0;y<oy+H/this.zoom;y+=step){c.beginPath();c.moveTo(ox,y);c.lineTo(ox+W/this.zoom,y);c.stroke()}
+  }
+  _drawRels(){
+    const c=this.ctx;
+    this.rels.forEach((r,i)=>{
+      const ft=this.tables.find(t=>t.id===r.from), tt=this.tables.find(t=>t.id===r.to);
+      if(!ft||!tt) return;
+      const[x1,y1]=ft.edgeTo(tt),[x2,y2]=tt.edgeTo(ft);
+      const mx=(x1+x2)/2, my=(y1+y2)/2;
+      const isSel=this.selected?.type==='rel'&&this.selected.idx===i;
+      c.strokeStyle=isSel?'#4090f0':'#555'; c.lineWidth=isSel?1.8:1;
+      c.setLineDash([6,3]);
+      c.beginPath(); c.moveTo(x1,y1);
+      c.bezierCurveTo((x1+mx)/2,y1,(x2+mx)/2,y2,x2,y2);
+      c.stroke(); c.setLineDash([]);
+      const angle=Math.atan2(y2-y1,x2-x1);
+      c.save(); c.translate(x2,y2); c.rotate(angle);
+      c.strokeStyle=isSel?'#4090f0':'#666'; c.lineWidth=1.2;
+      c.beginPath(); c.moveTo(-10,-5); c.lineTo(0,0); c.lineTo(-10,5); c.stroke();
+      c.restore();
+      c.fillStyle='#1e1e30';
+      this._roundRect(mx-17,my-10,34,18,4); c.fill();
+      c.strokeStyle='#2a2a50'; c.lineWidth=0.5;
+      this._roundRect(mx-17,my-10,34,18,4); c.stroke();
+      c.fillStyle=isSel?'#7ab':'#888';
+      c.font='500 10px sans-serif'; c.textAlign='center'; c.textBaseline='middle';
+      c.fillText(r.type,mx,my);
+    });
+  }
+  _drawConnectHighlight(){
+    if(!this.connectStart) return;
+    const t=this.tables.find(t=>t.id===this.connectStart); if(!t) return;
+    const c=this.ctx;
+    c.strokeStyle='#4090f0'; c.lineWidth=2; c.setLineDash([5,3]);
+    this._roundRect(t.x-3,t.y-3,TABLE_W+6,t.height+6,11); c.stroke();
+    c.setLineDash([]);
+  }
+  _drawTables(){
+    const c=this.ctx;
+    this.tables.forEach(t=>{
+      const th=t.height;
+      const isSel=this.selected?.type==='table'&&this.selected.id===t.id;
+      c.shadowColor='rgba(0,0,0,0.5)'; c.shadowBlur=isSel?18:8; c.shadowOffsetY=3;
+      c.fillStyle='#12121f';
+      this._roundRect(t.x,t.y,TABLE_W,th,8); c.fill();
+      c.shadowColor='transparent'; c.shadowBlur=0; c.shadowOffsetY=0;
+      c.strokeStyle=isSel?t.color:'rgba(255,255,255,0.08)';
+      c.lineWidth=isSel?1.5:0.5;
+      this._roundRect(t.x,t.y,TABLE_W,th,8); c.stroke();
+      c.fillStyle=t.pale;
+      this._roundRectTop(t.x,t.y,TABLE_W,HEADER_H,8); c.fill();
+      c.strokeStyle='rgba(255,255,255,0.06)'; c.lineWidth=0.5;
+      c.beginPath(); c.moveTo(t.x,t.y+HEADER_H); c.lineTo(t.x+TABLE_W,t.y+HEADER_H); c.stroke();
+      c.fillStyle=t.color; c.font='500 13px sans-serif';
+      c.textAlign='center'; c.textBaseline='middle';
+      c.fillText(t.name,t.x+TABLE_W/2,t.y+HEADER_H/2);
+      t.cols.forEach((col,ci)=>{
+        const cy=t.y+HEADER_H+4+ci*ROW_H;
+        if(ci%2===0){c.fillStyle='rgba(255,255,255,0.02)';c.fillRect(t.x+1,cy,TABLE_W-2,ROW_H)}
+        let nx=t.x+8;
+        if(col.pk){this._badge(nx,cy+5,18,'PK','#3a2800','#f0a030');nx+=22}
+        if(col.fk){this._badge(nx,cy+5,16,'FK','#001a3a','#4090d0');nx+=20}
+        c.fillStyle='#ccc'; c.font='12px sans-serif';
+        c.textAlign='left'; c.textBaseline='middle';
+        c.fillText(col.name,nx,cy+ROW_H/2);
+        c.fillStyle='#555'; c.font='10px monospace';
+        c.textAlign='right';
+        c.fillText(col.type,t.x+TABLE_W-6,cy+ROW_H/2);
+      });
+    });
+  }
+  _badge(x,y,w,txt,bg,fg){
+    const c=this.ctx;
+    c.fillStyle=bg; this._roundRect(x,y,w,14,3); c.fill();
+    c.fillStyle=fg; c.font='500 9px sans-serif';
+    c.textAlign='center'; c.textBaseline='middle';
+    c.fillText(txt,x+w/2,y+7);
+  }
+  _roundRect(x,y,w,h,r){
+    const c=this.ctx;
+    c.beginPath(); c.moveTo(x+r,y); c.lineTo(x+w-r,y);
+    c.arcTo(x+w,y,x+w,y+r,r); c.lineTo(x+w,y+h-r);
+    c.arcTo(x+w,y+h,x+w-r,y+h,r); c.lineTo(x+r,y+h);
+    c.arcTo(x,y+h,x,y+h-r,r); c.lineTo(x,y+r);
+    c.arcTo(x,y,x+r,y,r); c.closePath();
+  }
+  _roundRectTop(x,y,w,h,r){
+    const c=this.ctx;
+    c.beginPath(); c.moveTo(x+r,y); c.lineTo(x+w-r,y);
+    c.arcTo(x+w,y,x+w,y+r,r); c.lineTo(x+w,y+h);
+    c.lineTo(x,y+h); c.lineTo(x,y+r);
+    c.arcTo(x,y,x+r,y,r); c.closePath();
+  }
+  save(){
+    const data={tables:this.tables.map(t=>t.toJSON()),rels:this.rels.map(r=>r.toJSON()),uid:this._uid};
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='erd_diagram.json'; a.click();
+    URL.revokeObjectURL(url);
+  }
+  load(callback){
+    const input=document.createElement('input');
+    input.type='file'; input.accept='.json,application/json';
+    input.onchange=(e)=>{
+      const file=e.target.files[0]; if(!file) return;
+      const reader=new FileReader();
+      reader.onload=(ev)=>{
+        try{
+          const data=JSON.parse(ev.target.result);
+          this.tables=data.tables.map(t=>Table.fromJSON(t));
+          this.rels=data.rels.map(r=>Relation.fromJSON(r));
+          this._uid=data.uid||1;
+          this._syncUid();
+          this.selected=null;
+          this.fitView();
+          if(callback) callback();
+        } catch(err){ alert('الملف مش صحيح — تأكد إنه JSON من ERD Canvas') }
+      };
+      reader.readAsText(file);
+    };
+    input.click();
+  }
+  generateSQL(){
+    return this.tables.map(t=>t.toSQL(this.rels,this.tables)).join('\n\n');
+  }
+  _bindEvents(){
+    const cvs=this.cvs;
+    cvs.addEventListener('mousedown', e=>this._onMouseDown(e));
+    cvs.addEventListener('mousemove', e=>this._onMouseMove(e));
+    cvs.addEventListener('mouseup',   e=>this._onMouseUp(e));
+    cvs.addEventListener('wheel',     e=>this._onWheel(e),{passive:false});
+    window.addEventListener('resize', ()=>this.resize());
+    window.addEventListener('keydown', e=>{
+      if((e.key==='Delete'||e.key==='Backspace')&&document.activeElement===document.body){
+        if(erd.deleteSelected()) ui.renderPanel();
+      }
+    });
+  }
+  _evPos(e){
+    const r=this.cvs.getBoundingClientRect();
+    return this.toWorld(e.clientX-r.left,e.clientY-r.top);
+  }
+  _onMouseDown(e){
+    const[wx,wy]=this._evPos(e);
+    if(e.button===1||e.altKey){
+      this.isPanning=true; this.panStart={x:e.clientX-this.panX,y:e.clientY-this.panY};
+      this.cvs.style.cursor='grabbing'; return;
+    }
+    const t=this.hitTable(wx,wy);
+    if(this.connectMode){
+      if(t){
+        if(!this.connectStart){this.connectStart=t.id;this.draw()}
+        else if(this.connectStart!==t.id){
+          this.addRelation(this.connectStart,t.id);
+          this.connectStart=null;
+          this.draw(); ui.renderPanel();
+        }
+      } return;
+    }
+    if(t){
+      this.selected={type:'table',id:t.id};
+      this.drag={id:t.id,ox:wx-t.x,oy:wy-t.y};
+      this.tables=this.tables.filter(tt=>tt.id!==t.id).concat([t]);
+      this.draw(); ui.renderPanel(); return;
+    }
+    const ri=this.hitRel(wx,wy);
+    if(ri>=0){this.selected={type:'rel',idx:ri};this.draw();ui.renderPanel();return}
+    this.selected=null;
+    this.isPanning=true; this.panStart={x:e.clientX-this.panX,y:e.clientY-this.panY};
+    this.cvs.style.cursor='grabbing';
+    this.draw(); ui.renderPanel();
+  }
+  _onMouseMove(e){
+    const r=this.cvs.getBoundingClientRect();
+    const sx=e.clientX-r.left, sy=e.clientY-r.top;
+    const[wx,wy]=this.toWorld(sx,sy);
+    if(this.isPanning&&this.panStart){
+      this.panX=e.clientX-this.panStart.x;
+      this.panY=e.clientY-this.panStart.y;
+      this.draw(); return;
+    }
+    if(this.drag){
+      const t=this.tables.find(t=>t.id===this.drag.id);
+      if(t){t.x=wx-this.drag.ox; t.y=wy-this.drag.oy; this.draw()}
+    } else {
+      this.cvs.style.cursor=this.hitTable(wx,wy)?'grab':'default';
+    }
+  }
+  _onMouseUp(e){
+    this.drag=null; this.isPanning=false; this.panStart=null;
+    this.cvs.style.cursor='default';
+  }
+  _onWheel(e){
+    e.preventDefault();
+    const r=this.cvs.getBoundingClientRect();
+    const sx=e.clientX-r.left, sy=e.clientY-r.top;
+    this.zoomAt(sx,sy,e.deltaY<0?1.1:0.91);
+  }
+}
+
+// ══════════════════════════════════════════════
+//  UI CLASS
+// ══════════════════════════════════════════════
+class UI {
+  constructor(erd){
+    this.erd=erd;
+    this.dialog=document.getElementById('table-dialog');
+    this._bindToolbar();
+    this._bindDialog();
+  }
+  _bindToolbar(){
+    const e=this.erd;
+    document.getElementById('btn-add-table').onclick=()=>this.openDialog();
+    document.getElementById('btn-connect').onclick=()=>this.toggleConnect();
+    document.getElementById('btn-delete').onclick=()=>{e.deleteSelected();this.renderPanel()};
+    document.getElementById('btn-clear').onclick=()=>{e.clearAll();this.renderPanel()};
+    document.getElementById('btn-fit').onclick=()=>e.fitView();
+    document.getElementById('btn-zoom-in').onclick=()=>e.zoomIn();
+    document.getElementById('btn-zoom-out').onclick=()=>e.zoomOut();
+    document.getElementById('btn-sql').onclick=()=>this.showSQL();
+    document.getElementById('btn-save').onclick=()=>{e.save();this._toast('جاري التنزيل 💾')};
+    document.getElementById('btn-load').onclick=()=>e.load(()=>{this.renderPanel();this._toast('تم التحميل ✓')});
+  }
+  toggleConnect(){
+    this.erd.connectMode=!this.erd.connectMode;
+    this.erd.connectStart=null;
+    document.getElementById('btn-connect').classList.toggle('active',this.erd.connectMode);
+    document.getElementById('hint').textContent=this.erd.connectMode
+      ?'اضغط على جدول أول ثم جدول تاني للتوصيل — اضغط Connect مرة ثانية لإلغاء'
+      :'اسحب الجداول ● Connect لتوصيل ● اضغط على جدول للتعديل';
+    this.erd.draw();
+  }
+  openDialog(editTableId=null){
+    const nameInput=document.getElementById('dlg-table-name');
+    const submitBtn=document.getElementById('dlg-submit');
+    const titleEl=document.getElementById('dlg-title');
+    this.dlgCols=document.getElementById('dlg-columns');
+    this.dlgCols.innerHTML='';
+    if(editTableId){
+      const t=this.erd.tables.find(t=>t.id===editTableId); if(!t) return;
+      titleEl.textContent='تعديل الجدول';
+      submitBtn.textContent='حفظ التعديلات';
+      nameInput.value=t.name;
+      nameInput.classList.remove('error');
+      t.cols.forEach(c=>this._addDlgRow(c.name,c.type,c.pk,c.fk));
+      this.dialog.dataset.editId=String(editTableId);
+    } else {
+      titleEl.textContent='إنشاء جدول جديد';
+      submitBtn.textContent='إنشاء الجدول';
+      nameInput.value='';
+      nameInput.classList.remove('error');
+      delete this.dialog.dataset.editId;
+      this._addDlgRow('id','INT',true,false);
+    }
+    this._syncEmpty();
+    this.dialog.showModal();
+    setTimeout(()=>nameInput.focus(),60);
+  }
+  _syncEmpty(){
+    const empty=document.getElementById('dlg-empty');
+    const cols=document.getElementById('dlg-columns');
+    if(!empty||!cols) return;
+    empty.style.display=cols.children.length===0?'block':'none';
+  }
+  _addDlgRow(name='',type='VARCHAR',pk=false,fk=false){
+    const cols=document.getElementById('dlg-columns');
+    const div=document.createElement('div');
+    div.className='dlg-col-row';
+    div.innerHTML=`
+      <input type="text" class="col-name" placeholder="اسم العمود" value="${name}">
+      <select class="col-type">${TYPES.map(t=>`<option${t===type?' selected':''}>${t}</option>`).join('')}</select>
+      <button type="button" class="col-pk-btn${pk?' active':''}" title="Primary Key">PK</button>
+      <button type="button" class="col-fk-btn${fk?' active':''}" title="Foreign Key">FK</button>
+      <button type="button" class="del-col" title="حذف">&#x2715;</button>`;
+    div.querySelector('.col-pk-btn').addEventListener('click',function(){this.classList.toggle('active')});
+    div.querySelector('.col-fk-btn').addEventListener('click',function(){this.classList.toggle('active')});
+    div.querySelector('.del-col').addEventListener('click',()=>{div.remove();this._syncEmpty()});
+    cols.appendChild(div);
+    this._syncEmpty();
+    div.querySelector('.col-name').focus();
+  }
+  _bindDialog(){
+    document.getElementById('dlg-add-col').addEventListener('click',()=>this._addDlgRow());
+    document.getElementById('dlg-cancel').addEventListener('click',()=>this.dialog.close());
+    document.getElementById('dlg-cancel2').addEventListener('click',()=>this.dialog.close());
+    document.getElementById('dlg-submit').addEventListener('click',()=>this._submitDialog());
+    this.dialog.addEventListener('click',e=>{if(e.target===this.dialog) this.dialog.close()});
+    document.getElementById('dlg-table-name').addEventListener('keydown',e=>{
+      if(e.key==='Enter'){e.preventDefault();this._submitDialog()}
+    });
+  }
+  _submitDialog(){
+    const nameInput=document.getElementById('dlg-table-name');
+    const name=nameInput.value.trim();
+    if(!name){
+      nameInput.classList.add('error');
+      nameInput.focus();
+      nameInput.placeholder='اكتب اسم الجدول أولاً!';
+      setTimeout(()=>nameInput.classList.remove('error'),1200);
+      return;
+    }
+    const rows=[...document.querySelectorAll('#dlg-columns .dlg-col-row')];
+    const cols=rows.map(row=>({
+      name:row.querySelector('.col-name').value.trim()||'col',
+      type:row.querySelector('.col-type').value,
+      pk:row.querySelector('.col-pk-btn').classList.contains('active'),
+      fk:row.querySelector('.col-fk-btn').classList.contains('active'),
+    }));
+    const editId=this.dialog.dataset.editId?parseInt(this.dialog.dataset.editId):null;
+    if(editId){
+      const t=this.erd.tables.find(t=>t.id===editId);
+      if(t){
+        t.rename(name);
+        t.cols=cols.map(c=>new Col(this.erd.gid(),c.name,c.type,c.pk,c.fk));
+        this.erd.selected={type:'table',id:t.id};
+        this.erd.draw(); this.renderPanel();
+        this._toast(`تم تعديل "${name}" ✓`);
+      }
+    } else {
+      const t=this.erd.createTable(name,cols);
+      this.erd.selected={type:'table',id:t.id};
+      this.renderPanel();
+      this._toast(`تم إنشاء "${name}" ✓`);
+    }
+    this.dialog.close();
+  }
+  renderPanel(){
+    const sp=document.getElementById('sp-content');
+    const sel=this.erd.selected;
+    if(!sel){sp.innerHTML='<span style="color:#555;font-size:12px">اضغط على عنصر لتعديله</span>';return}
+    if(sel.type==='table'){
+      const t=this.erd.tables.find(t=>t.id===sel.id);
+      if(!t){sp.innerHTML='';return}
+      let html=`
+        <div class="sp-row">
+          <label>اسم الجدول</label>
+          <input value="${t.name}" onchange="erd.tables.find(t=>t.id==${t.id}).rename(this.value);erd.draw()">
+        </div>
+        <div class="sp-row">
+          <label>اللون</label>
+          <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:3px">
+            ${PALETTE.map((col,i)=>`<div class="color-dot" onclick="erd.tables.find(t=>t.id==${t.id}).setColor(${i});erd.draw();ui.renderPanel()"
+              style="background:${col};border:2px solid ${col===t.color?'#fff':'transparent'}"></div>`).join('')}
+          </div>
+        </div>
+        <div class="sp-row">
+          <label>الأعمدة</label>
+          <div id="cols-panel">`;
+      t.cols.forEach(col=>{
+        html+=`<div class="col-item">
+          <span class="badge bpk${col.pk?' on':''}" onclick="erd.tables.find(t=>t.id==${t.id}).getCol(${col.id}).togglePK();erd.draw();ui.renderPanel()">PK</span>
+          <span class="badge bfk${col.fk?' on':''}" onclick="erd.tables.find(t=>t.id==${t.id}).getCol(${col.id}).toggleFK();erd.draw();ui.renderPanel()">FK</span>
+          <input value="${col.name}" onchange="erd.tables.find(t=>t.id==${t.id}).getCol(${col.id}).setName(this.value);erd.draw()">
+          <select onchange="erd.tables.find(t=>t.id==${t.id}).getCol(${col.id}).setType(this.value);erd.draw()">
+            ${TYPES.map(tp=>`<option${tp===col.type?' selected':''}>${tp}</option>`).join('')}
+          </select>
+          <button class="ib" onclick="erd.tables.find(t=>t.id==${t.id}).removeCol(${col.id});erd.draw();ui.renderPanel()">&#x2715;</button>
+        </div>`;
+      });
+      html+=`</div>
+          <button class="add-col-btn" onclick="erd.tables.find(t=>t.id==${t.id}).addCol(new Col(erd.gid(),'col','VARCHAR',false,false));erd.draw();ui.renderPanel()">+ عمود</button>
+        </div>
+        <button class="tb-btn" style="width:100%;margin-top:4px" onclick="ui.openDialog(${t.id})">&#x270F;&#xFE0F; تعديل كامل</button>
+        <button class="tb-btn danger" style="width:100%;margin-top:4px" onclick="erd.deleteSelected();ui.renderPanel()">حذف الجدول</button>`;
+      sp.innerHTML=html;
+    } else if(sel.type==='rel'){
+      const r=this.erd.rels[sel.idx]; if(!r){sp.innerHTML='';return}
+      const ft=this.erd.tables.find(t=>t.id===r.from);
+      const tt=this.erd.tables.find(t=>t.id===r.to);
+      sp.innerHTML=`
+        <div class="sp-row">
+          <label>العلاقة</label>
+          <div style="font-size:13px;color:#ccc;padding:4px 0">${ft?.name||'?'} &#x2192; ${tt?.name||'?'}</div>
+        </div>
+        <div class="sp-row">
+          <label>نوع العلاقة</label>
+          <select onchange="erd.rels[${sel.idx}].setType(this.value);erd.draw()">
+            ${['1:1','1:N','N:M'].map(tp=>`<option${tp===r.type?' selected':''}>${tp}</option>`).join('')}
+          </select>
+        </div>
+        <button class="tb-btn danger" style="width:100%;margin-top:8px" onclick="erd.deleteSelected();ui.renderPanel()">حذف العلاقة</button>`;
+    }
+  }
+  showSQL(){
+    const sql=this.erd.generateSQL().replace(/</g,'&lt;');
+    document.getElementById('sp-content').innerHTML=`
+      <div class="sp-title" style="margin-bottom:8px">SQL Output</div>
+      <div class="sql-out">${sql}</div>
+      <button class="tb-btn" style="width:100%;margin-top:6px"
+        onclick="navigator.clipboard.writeText(erd.generateSQL()).then(()=>ui._toast('تم النسخ ✓'))">
+        Copy SQL
+      </button>
+      <button class="tb-btn" style="width:100%;margin-top:4px" onclick="erd.selected=null;ui.renderPanel()">&#x2190; رجوع</button>`;
+  }
+  _toast(msg){
+    const t=document.createElement('div');
+    t.textContent=msg;
+    Object.assign(t.style,{
+      position:'fixed',bottom:'24px',left:'50%',transform:'translateX(-50%)',
+      background:'#185FA5',color:'#fff',padding:'8px 18px',borderRadius:'8px',
+      fontSize:'13px',zIndex:'9999',transition:'opacity .4s'
+    });
+    document.body.appendChild(t);
+    setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),400)},1800);
+  }
+}
+
+// ══════════════════════════════════════════════
+//  HelpSystem CLASS
+// ══════════════════════════════════════════════
+class HelpSystem {
+  constructor(){
+    this.steps   = [];
+    this.current = 0;
+
+    this.overlay  = document.getElementById('help-overlay');
+    this.backdrop = document.getElementById('help-backdrop');
+    this.box      = document.getElementById('help-box');
+    this.textEl   = document.getElementById('help-text');
+    this.arrow    = document.getElementById('help-arrow');
+    this.ring     = document.getElementById('help-ring');
+    this.badge    = document.getElementById('help-step-badge');
+    this.progress = document.getElementById('help-progress');
+
+    document.getElementById('help-next').addEventListener('click', ()=>this.next());
+    document.getElementById('help-skip').addEventListener('click', ()=>this.hide());
+    document.getElementById('help-box-close').addEventListener('click', ()=>this.hide());
+
+    // اضغط Escape لإغلاق
+    document.addEventListener('keydown', e=>{ if(e.key==='Escape') this.hide() });
+  }
+
+  start(steps){
+    this.steps   = steps;
+    this.current = 0;
+    this.overlay.classList.add('active');
+    this.overlay.style.display = 'block';
+    this._showStep();
+  }
+
+  _showStep(){
+    const step = this.steps[this.current];
+    const el   = document.querySelector(step.selector);
+    if(!el){ this.next(); return; }
+
+    // -- نص وبادج --
+    this.textEl.innerHTML = step.text;
+    this.badge.textContent = `خطوة ${this.current+1} / ${this.steps.length}`;
+    this.progress.textContent = '';
+
+    // -- حساب موضع العنصر --
+    const r   = el.getBoundingClientRect();
+    const PAD = 6;   // مسافة إضافية حول الـ ring
+
+    // تحديث الـ ring حول العنصر
+    Object.assign(this.ring.style,{
+      display : 'block',
+      top     : (r.top  - PAD) + 'px',
+      left    : (r.left - PAD) + 'px',
+      width   : (r.width  + PAD*2) + 'px',
+      height  : (r.height + PAD*2) + 'px',
+    });
+
+    // -- حساب موضع البوكس --
+    this.box.style.visibility = 'hidden';
+    this.box.style.display    = 'block';
+    const bW = this.box.offsetWidth;
+    const bH = this.box.offsetHeight;
+    this.box.style.visibility = 'visible';
+
+    const ARROW_H = 12;   // ارتفاع السهم
+    const GAP     = 8;    // مسافة بين العنصر والسهم
+
+    const spaceBelow = window.innerHeight - r.bottom;
+    const spaceAbove = r.top;
+
+    let boxTop, arrowDir;
+
+    if(spaceBelow >= bH + ARROW_H + GAP + 10 || spaceBelow >= spaceAbove){
+      // ⬇ البوكس تحت العنصر — السهم بيشاور لفوق (يعني عند أعلى البوكس)
+      boxTop   = r.bottom + GAP + ARROW_H;
+      arrowDir = 'up';
+    } else {
+      // ⬆ البوكس فوق العنصر — السهم بيشاور لتحت (يعني عند أسفل البوكس)
+      boxTop   = r.top - bH - GAP - ARROW_H;
+      arrowDir = 'down';
+    }
+
+    // ضبط الـ left: تمركز أفقي مع منع الخروج من الشاشة
+    let boxLeft = r.left + r.width/2 - bW/2;
+    boxLeft = Math.max(10, Math.min(boxLeft, window.innerWidth - bW - 10));
+
+    this.box.style.top  = boxTop  + 'px';
+    this.box.style.left = boxLeft + 'px';
+
+    // animation
+    this.box.classList.remove('help-box-anim');
+    void this.box.offsetWidth;   // force reflow
+    this.box.classList.add('help-box-anim');
+
+    // -- السهم --
+    this.arrow.setAttribute('data-dir', arrowDir);
+
+    // مركز العنصر أفقياً
+    const elCX = r.left + r.width/2;
+
+    if(arrowDir === 'up'){
+      // السهم بين العنصر وأعلى البوكس
+      this.arrow.style.top  = (r.bottom + GAP) + 'px';
+      this.arrow.style.left = (elCX - 9) + 'px';
+    } else {
+      // السهم بين أسفل البوكس والعنصر
+      this.arrow.style.top  = (r.top - GAP - ARROW_H) + 'px';
+      this.arrow.style.left = (elCX - 9) + 'px';
+    }
+
+    // زر "التالي" يتحول لـ "إنهاء" في آخر خطوة
+    const nextBtn = document.getElementById('help-next');
+    nextBtn.textContent = this.current === this.steps.length-1 ? '✓ إنهاء' : 'التالي →';
+  }
+
+  next(){
+    this.current++;
+    if(this.current >= this.steps.length){ this.hide(); return; }
+    this._showStep();
+  }
+
+  hide(){
+    this.overlay.classList.remove('active');
+    this.overlay.style.display = 'none';
+    this.ring.style.display    = 'none';
+  }
+}
+
+// ══════════════════════════════════════════════
+//  INIT
+// ══════════════════════════════════════════════
+const erd = new ERDCanvas(
+  document.getElementById('canvas'),
+  document.getElementById('canvas-wrap'));
+const ui   = new UI(erd);
+const help = new HelpSystem();
+
+erd.draw();
+ui.renderPanel();
+
+// ── Help button ──
+document.getElementById('btn-help').addEventListener('click', ()=>{
+  help.start([
+    {
+      selector: '#btn-add-table',
+      text: '<strong>+ Table</strong><br>اضغط هنا عشان تفتح نافذة إنشاء جدول جديد — سمّيه، حدد الأعمدة، واختار النوع والـ PK/FK.'
+    },
+    {
+      selector: '#btn-connect',
+      text: '<strong>🔗 Connect</strong><br>فعّله ثم اضغط على <strong>جدولين</strong> بالترتيب عشان يتعمل خط علاقة بينهم. اضغطه تاني لإلغاء.'
+    },
+    {
+      selector: '#canvas-wrap',
+      text: '<strong>الـ Canvas</strong><br>اسحب أي جدول من هنا وحركه في أي مكان. عجلة الماوس للـ Zoom، واسحب الفراغ للـ Pan.'
+    },
+    {
+      selector: '#side-panel',
+      text: '<strong>Properties</strong><br>اضغط على أي جدول أو علاقة وهتشوف تفاصيله هنا — تقدر تعدل الاسم، اللون، الأعمدة، ونوع العلاقة.'
+    },
+    {
+      selector: '#btn-sql',
+      text: '<strong>SQL ↗</strong><br>بيولّد <code>CREATE TABLE</code> و<code>FOREIGN KEY</code> جاهزين تنسخهم وتشغلهم في أي قاعدة بيانات.'
+    },
+    {
+      selector: '#btn-save',
+      text: '<strong>💾 Save / 📂 Load</strong><br>Save بينزّل ملف <code>.json</code> على جهازك، وLoad بيرجّعه في أي وقت.'
+    },
+  ]);
+});
